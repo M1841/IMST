@@ -1,15 +1,16 @@
-#include <assert.h>
-#include <errno.h>
+#include <cassert>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 const size_t MAX_MESSAGE_SIZE = 4096;
 
-static int32_t query(int, const char *);
+static int32_t send_request(int, const char *);
+static int32_t read_response(int);
 
 static int32_t read_full_message(int, char *, size_t);
 static int32_t write_full_message(int, const char *, size_t);
@@ -36,21 +37,28 @@ int main()
     exit_with_error("connect()");
   }
 
-  int32_t error_code = query(client_socket, "hello1");
-  if (!error_code)
+  const char *query_list[3] = {"hello1", "hello2", "hello3"};
+  for (size_t i = 0; i < 3; ++i)
   {
-    error_code = query(client_socket, "hello2");
-    if (!error_code)
+    int32_t error = send_request(client_socket, query_list[i]);
+    if (error)
     {
-      error_code = query(client_socket, "hello3");
+      close(client_socket);
+      return 0;
     }
   }
-
-  close(client_socket);
-  return 0;
+  for (size_t i = 0; i < 3; ++i)
+  {
+    int32_t error = read_response(client_socket);
+    if (error)
+    {
+      close(client_socket);
+      return 0;
+    }
+  }
 }
 
-static int32_t query(int socket, const char *message)
+static int32_t send_request(int socket, const char *message)
 {
   uint32_t message_length = (uint32_t)strlen(message);
   if (message_length > MAX_MESSAGE_SIZE)
@@ -68,16 +76,22 @@ static int32_t query(int socket, const char *message)
     return error_code;
   }
 
+  return 0;
+}
+
+static int32_t read_response(int socket)
+{
   char read_buffer[4 + MAX_MESSAGE_SIZE + 1];
   errno = 0;
 
-  error_code = read_full_message(socket, read_buffer, 4);
+  int32_t error_code = read_full_message(socket, read_buffer, 4);
   if (error_code)
   {
     print_error_message(errno ? "read() error" : "EOF");
     return error_code;
   }
 
+  uint32_t message_length = 0;
   memcpy(&message_length, read_buffer, 4);
   if (message_length > MAX_MESSAGE_SIZE)
   {

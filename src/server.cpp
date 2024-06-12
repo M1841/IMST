@@ -1,19 +1,49 @@
-#include <assert.h>
-#include <errno.h>
+#include <cassert>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 const size_t MAX_MESSAGE_SIZE = 4096;
 
-static int32_t handle_single_request(int);
+enum
+{
+  STATE_REQ = 0,
+  STATE_RES = 1,
+  STATE_END = 2,
+};
 
-static int32_t read_full_message(int, char *, size_t);
-static int32_t write_full_message(int, const char *, size_t);
+struct Connection
+{
+  int socket = -1;
+  uint32_t state = 0;
+
+  size_t read_buffer_size = 0;
+  uint8_t read_buffer[4 + MAX_MESSAGE_SIZE];
+
+  size_t write_buffer_size = 0;
+  size_t write_buffer_sent = 0;
+  uint8_t write_buffer[4 + MAX_MESSAGE_SIZE];
+};
+
+static void socket_set_nonblocking(int);
+
+static void connection_put(std::vector<Connection *> &, struct Connection *);
+static int32_t connection_accept(std::vector<Connection *> &, int);
+static void connection_io(Connection *);
+
+static void state_request(Connection *);
+static void state_response(Connection *);
+
+static bool try_fill_buffer(Connection *);
+static bool try_flush_buffer(Connection *);
+static bool try_one_request(Connection *);
 
 static void exit_with_error(const char *);
 static void print_error_message(const char *);
@@ -46,101 +76,271 @@ int main()
     exit_with_error("listen()");
   }
 
+  std::vector<Connection *> conns;
+
+  socket_set_nonblocking(server_socket);
+
+  std::vector<struct pollfd> poll_args;
   while (true)
   {
-    struct sockaddr_in client_addr = {};
-    socklen_t client_addr_length = sizeof(client_addr);
+    poll_args.clear();
 
-    int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_length);
-    if (client_socket < 0)
+    struct pollfd server_poll = {server_socket, POLLIN, 0};
+    poll_args.push_back(server_poll);
+
+    for (Connection *conn : conns)
     {
-      continue;
+      if (!conn)
+      {
+        continue;
+      }
+
+      struct pollfd client_poll = {};
+      client_poll.fd = conn->socket;
+      client_poll.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
+      client_poll.events |= POLLERR;
+
+      poll_args.push_back(client_poll);
     }
 
-    while (true)
+    int poll_result = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
+    if (poll_result < 0)
     {
-      int32_t error_code = handle_single_request(client_socket);
-      if (error_code)
+      exit_with_error("poll");
+    }
+
+    for (size_t i = 1; i < poll_args.size(); ++i)
+    {
+      if (poll_args[i].revents)
       {
-        break;
+        Connection *conn = conns[poll_args[i].fd];
+        connection_io(conn);
+
+        if (conn->state == STATE_END)
+        {
+          conns[conn->socket] = NULL;
+          (void)close(conn->socket);
+          free(conn);
+        }
       }
     }
-    close(client_socket);
+
+    if (poll_args[0].revents)
+    {
+      (void)connection_accept(conns, server_socket);
+    }
   }
 
   return 0;
 }
 
-static int32_t handle_single_request(int client_socket)
+static void socket_set_nonblocking(int socket)
 {
-  char read_buffer[4 + MAX_MESSAGE_SIZE + 1];
   errno = 0;
-
-  int32_t error_code = read_full_message(client_socket, read_buffer, 4);
-  if (error_code)
+  int flags = fcntl(socket, F_GETFL, 0);
+  if (errno)
   {
-    print_error_message(errno ? "read() error" : "EOF");
-    return error_code;
+    exit_with_error("fcntl error");
+    return;
   }
 
-  uint32_t message_length = 0;
-  memcpy(&message_length, read_buffer, 4);
-  if (message_length > MAX_MESSAGE_SIZE)
+  flags |= O_NONBLOCK;
+
+  errno = 0;
+  (void)fcntl(socket, F_SETFL, flags);
+  if (errno)
   {
-    print_error_message("too long");
+    exit_with_error("fcntl error");
+  }
+}
+
+static void connection_put(std::vector<Connection *> &conns, struct Connection *conn)
+{
+  if (conns.size() <= (size_t)conn->socket)
+  {
+    conns.resize(conn->socket + 1);
+  }
+  conns[conn->socket] = conn;
+}
+
+static int32_t connection_accept(std::vector<Connection *> &conns, int socket)
+{
+  struct sockaddr_in client_address = {};
+  socklen_t client_address_length = sizeof(client_address);
+
+  int client_socket = accept(socket, (struct sockaddr *)&client_address, &client_address_length);
+  if (client_socket < 0)
+  {
+    print_error_message("accept() error");
     return -1;
   }
 
-  error_code = read_full_message(client_socket, &read_buffer[4], message_length);
-  if (error_code)
+  socket_set_nonblocking(client_socket);
+
+  struct Connection *conn = (struct Connection *)malloc(sizeof(struct Connection));
+  if (!conn)
+  {
+    close(client_socket);
+    return -1;
+  }
+
+  conn->socket = client_socket;
+  conn->state = STATE_REQ;
+  conn->read_buffer_size = 0;
+  conn->write_buffer_size = 0;
+  conn->write_buffer_sent = 0;
+  connection_put(conns, conn);
+
+  return 0;
+}
+
+static void connection_io(Connection *conn)
+{
+  if (conn->state == STATE_REQ)
+  {
+    state_request(conn);
+  }
+  else if (conn->state == STATE_RES)
+  {
+    state_response(conn);
+  }
+  else
+  {
+    assert(0);
+  }
+}
+
+static void state_request(Connection *conn)
+{
+  while (try_fill_buffer(conn))
+  {
+  }
+}
+
+static void state_response(Connection *conn)
+{
+  while (try_flush_buffer(conn))
+  {
+  }
+}
+
+static bool try_fill_buffer(Connection *conn)
+{
+  assert(conn->read_buffer_size < sizeof(conn->read_buffer_size));
+
+  ssize_t read_result = 0;
+  do
+  {
+    size_t num_bytes = sizeof(conn->read_buffer) - conn->read_buffer_size;
+    read_result = read(conn->socket, &conn->read_buffer[conn->read_buffer_size], num_bytes);
+  } while (read_result < 0 && errno == EAGAIN);
+
+  if (read_result < 0 && errno == EAGAIN)
+  {
+    return false;
+  }
+  if (read_result < 0)
   {
     print_error_message("read() error");
-    return error_code;
+    conn->state = STATE_END;
+    return false;
+  }
+  if (read_result == 0)
+  {
+    if (conn->read_buffer_size > 0)
+    {
+      print_error_message("unexpected EOF");
+    }
+    else
+    {
+      print_error_message("EOF");
+    }
+
+    conn->state = STATE_END;
+    return false;
   }
 
-  read_buffer[4 + message_length] = '\0';
-  printf("client says: %s\n", &read_buffer[4]);
+  conn->read_buffer_size += (size_t)read_result;
+  assert(conn->read_buffer_size <= sizeof(conn->read_buffer));
 
-  const char reply[] = "world!";
-  char write_buffer[4 + sizeof(reply)];
-  message_length = (uint32_t)strlen(reply);
+  while (try_one_request(conn))
+  {
+  }
 
-  memcpy(write_buffer, &message_length, 4);
-  memcpy(&write_buffer[4], reply, message_length);
-
-  return write_full_message(client_socket, write_buffer, 4 + message_length);
+  return (conn->state == STATE_REQ);
 }
 
-static int32_t read_full_message(int socket, char *buffer, size_t num_bytes)
+static bool try_flush_buffer(Connection *conn)
 {
-  while (num_bytes > 0)
+  ssize_t write_result = 0;
+  do
   {
-    ssize_t num_bytes_read = read(socket, buffer, num_bytes);
-    if (num_bytes_read <= 0)
-    {
-      return -1;
-    }
-    assert((size_t)num_bytes_read <= num_bytes);
-    num_bytes -= (size_t)num_bytes_read;
-    buffer += num_bytes_read;
+    size_t remaining_bytes = conn->write_buffer_size - conn->write_buffer_sent;
+    write_result = write(conn->socket, &conn->write_buffer[conn->write_buffer_sent], remaining_bytes);
+  } while (write_result < 0 && errno == EINTR);
+
+  if (write_result < 0 && errno == EAGAIN)
+  {
+    return false;
   }
-  return 0;
+  if (write_result < 0)
+  {
+    print_error_message("write() error");
+    conn->state = STATE_END;
+    return false;
+  }
+
+  conn->write_buffer_sent += (size_t)write_result;
+  assert(conn->write_buffer_sent <= conn->write_buffer_size);
+
+  if (conn->write_buffer_sent == conn->write_buffer_size)
+  {
+    conn->state = STATE_REQ;
+    conn->write_buffer_sent = 0;
+    conn->write_buffer_size = 0;
+    return false;
+  }
+  return true;
 }
 
-static int32_t write_full_message(int socket, const char *buffer, size_t num_bytes)
+static bool try_one_request(Connection *conn)
 {
-  while (num_bytes > 0)
+  if (conn->read_buffer_size < 4)
   {
-    ssize_t num_bytes_written = write(socket, buffer, num_bytes);
-    if (num_bytes_written <= 0)
-    {
-      return -1;
-    }
-    assert((size_t)num_bytes_written <= num_bytes);
-    num_bytes -= (size_t)num_bytes_written;
-    buffer += num_bytes_written;
+    return false;
   }
-  return 0;
+
+  uint32_t message_length = 0;
+  memcpy(&message_length, &conn->read_buffer[0], 4);
+
+  if (message_length > MAX_MESSAGE_SIZE)
+  {
+    print_error_message("too long");
+    conn->state = STATE_END;
+    return false;
+  }
+  if (4 + message_length > conn->read_buffer_size)
+  {
+    return false;
+  }
+
+  printf("client says: %.*s\n", message_length, &conn->read_buffer[4]);
+
+  memcpy(&conn->write_buffer[0], &message_length, 4);
+  memcpy(&conn->write_buffer[4], &conn->read_buffer[4], message_length);
+  conn->write_buffer_size = 4 + message_length;
+
+  size_t remaining_bytes = conn->read_buffer_size - 4 - message_length;
+  if (remaining_bytes > 0)
+  {
+    memmove(conn->read_buffer, &conn->read_buffer[4 + message_length], remaining_bytes);
+  }
+  conn->read_buffer_size = remaining_bytes;
+
+  conn->state = STATE_RES;
+  state_response(conn);
+
+  return (conn->state == STATE_REQ);
 }
 
 static void exit_with_error(const char *message)
